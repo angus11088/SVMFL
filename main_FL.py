@@ -24,7 +24,7 @@ def main_FL(args: object):
 
     # wandb init
     # wandb.init(project = args.project, name = args.name, config = args.__dict__, anonymous = "allow")
-    wandb.init(project = 'FL-1811232016', name = args.name, config = args.__dict__, anonymous = "allow")
+    wandb.init(project = 'FL1811232016', name = args.name, config = args.__dict__, anonymous = "allow")
     
     # federated learning
     federated_learning(args, train_clients, test_clients, global_model)
@@ -59,6 +59,55 @@ if __name__ == '__main__':
                 args.name += 'num_sample: ' + str(args.dbscan_num_sample) + ','
             elif args.cluster_method == 'HDBSCAN':
                 args.name += 'min_cluster_size: ' + str(args.hdbscan_min_cluster_size) + ','
+            elif args.cluster_method == 'GaussianMixture':
+                args.name += 'K: ' + str(args.num_clusters) + ','  # 添加GaussianMixture的num_clusters參數
+            elif args.cluster_method == 'GaussianMixtureDBSCAN':
+                args.name += 'gmm_num_clusters: ' + str(args.gmm_num_clusters) + ','
+                args.name += 'gmm_covariance_type: ' + str(args.gmm_covariance_type) + ','
+                args.name += 'gmm_tol: ' + str(args.gmm_tol) + ','
+                args.name += 'gmm_max_iter: ' + str(args.gmm_max_iter) + ','
+                args.name += 'gmm_random_state: ' + str(args.gmm_random_state) + ','
+                args.name += 'eps: ' + str(args.dbscan_eps) + ','
+                args.name += 'num_sample: ' + str(args.dbscan_num_sample) + ','
+            elif args.cluster_method == 'GMMDBSCAN':
+               args.name += 'gmm_num_clusters: ' + str(args.gmm_num_clusters) + ','
+               args.name += 'gmm_covariance_type: ' + str(args.gmm_covariance_type) + ','
+               args.name += 'gmm_tol: ' + str(args.gmm_tol) + ','
+               args.name += 'gmm_max_iter: ' + str(args.gmm_max_iter) + ','
+               args.name += 'gmm_random_state: ' + str(args.gmm_random_state) + ','
+               args.name += 'eps: ' + str(args.dbscan_eps) + ','
+               args.name += 'num_sample: ' + str(args.dbscan_num_sample) + ','
+               args.name += 'malicious: ' + str(args.malicious) + ','
+            args.name += str(args.logits_optim).split('.')[-1][:-2] + ' ' + str(args.logits_lr)
+        case 'FedGMMDBACG':
+            args.name += 'Method: ' + str(args.cluster_method) + ','
+            if args.cluster_method == 'KMeans' or args.cluster_method == 'KMedoids':
+                args.name += 'K: ' + str(args.num_clusters) + ','
+            elif args.cluster_method == 'DBSCAN':
+                args.name += 'eps: ' + str(args.dbscan_eps) + ','
+                args.name += 'num_sample: ' + str(args.dbscan_num_sample) + ','
+            elif args.cluster_method == 'HDBSCAN':
+                args.name += 'min_cluster_size: ' + str(args.hdbscan_min_cluster_size) + ','
+            elif args.cluster_method == 'GaussianMixture':
+                args.name += 'K: ' + str(args.num_clusters) + ','  # 添加GaussianMixture的num_clusters參數
+            elif args.cluster_method == 'GaussianMixtureDBSCAN':
+                args.name += 'gmm_num_clusters: ' + str(args.gmm_num_clusters) + ','
+                args.name += 'gmm_covariance_type: ' + str(args.gmm_covariance_type) + ','
+                args.name += 'gmm_tol: ' + str(args.gmm_tol) + ','
+                args.name += 'gmm_max_iter: ' + str(args.gmm_max_iter) + ','
+                args.name += 'gmm_random_state: ' + str(args.gmm_random_state) + ','
+                args.name += 'eps: ' + str(args.dbscan_eps) + ','
+                args.name += 'num_sample: ' + str(args.dbscan_num_sample) + ','
+                args.name += 'malicious: ' + str(args.malicious) + ','
+            elif args.cluster_method == 'GMMDBSCAN':
+               args.name += 'gmm_num_clusters: ' + str(args.gmm_num_clusters) + ','
+               args.name += 'gmm_covariance_type: ' + str(args.gmm_covariance_type) + ','
+               args.name += 'gmm_tol: ' + str(args.gmm_tol) + ','
+               args.name += 'gmm_max_iter: ' + str(args.gmm_max_iter) + ','
+               args.name += 'gmm_random_state: ' + str(args.gmm_random_state) + ','
+               args.name += 'eps: ' + str(args.dbscan_eps) + ','
+               args.name += 'num_sample: ' + str(args.dbscan_num_sample) + ','
+               args.name += 'malicious: ' + str(args.malicious) + ','
             args.name += str(args.logits_optim).split('.')[-1][:-2] + ' ' + str(args.logits_lr)
         case _:
             raise Exception("wrong switch_FL:", args.switch_FL)

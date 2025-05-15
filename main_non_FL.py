@@ -29,8 +29,8 @@ def main_non_FL(args: object) -> None:
     # dataset and data loader 
     train_dataset = torch.utils.data.ConcatDataset([c.dataset for c in train_clients])
     test_dataset  = torch.utils.data.ConcatDataset([c.dataset for c in test_clients ])
-    train_loader  = torch.utils.data.DataLoader(train_dataset, batch_size = args.global_bs, shuffle = True)
-    test_loader   = torch.utils.data.DataLoader(test_dataset , batch_size = args.global_bs, shuffle = False)
+    train_loader  = torch.utils.data.DataLoader(train_dataset, batch_size = args.global_bs, shuffle = True, pin_memory = True)
+    test_loader   = torch.utils.data.DataLoader(test_dataset , batch_size = args.global_bs, shuffle = False, pin_memory = True)
     
     # wandb init
     wandb.init(project = args.project, name = args.name, config = args.__dict__, anonymous = "allow")

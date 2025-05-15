@@ -33,7 +33,7 @@ class Client(object):
         
         # datasets and data loaders
         self.dataset = Dataset(client_data_dict['x'], client_data_dict['y'])
-        self.data_loader = torch.utils.data.DataLoader(self.dataset, batch_size = self.client_bs, shuffle = not self.MOON)
+        self.data_loader = torch.utils.data.DataLoader(self.dataset, batch_size = self.client_bs, shuffle = not self.MOON, pin_memory = True)
             
     def local_train(self, client_model: torch.nn.Module, global_model: torch.nn.Module, previous_feature: torch.Tensor) -> list | torch.Tensor:
         """
