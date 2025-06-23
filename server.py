@@ -23,6 +23,7 @@ from sklearn_extra.cluster import KMedoids
 from sklearn.preprocessing import StandardScaler
 from sklearn.mixture import GaussianMixture
 from sklearn.metrics import accuracy_score
+from sklearn.metrics import pairwise_distances_argmin_min
 from models import model_eval, cal_metrics
 from utils import weighted_avg_params, weighted_avg, weighted_avg_with_momentum_forType, weighted_avg_with_momentum_ACG
 from torchmetrics.functional import pairwise_cosine_similarity
@@ -38,42 +39,160 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 # FedAwS cosine similarity margin
 margin = 0
 
+# =========================
+# ✅ 1️⃣ 建立計數器
+num_zscore_used = 0
+num_cluster_used = 0
+
+# =========================
+#threshold=2.5 來源為 Z-score 應用廣泛，包含文獻 Detecting Anomalies using Z-Score、federated learning robust aggregation 也常見（例如 RobustFedAvg, Krum 等文獻背景均支持）。
 def filter_outlier_clients(global_model, client_models, client_weights, method='zscore', threshold=2.5):
     deltas = []
     global_device = next(global_model.parameters()).device
     for model in client_models:
         squared_diff = 0.0
+        #計算單一 client 在 local training 後，它的模型參數與當前 global 模型參數之間的「整體 L2 距離」
+        #PyTorch 的 norm 是針對單個 tensor，所以若想計算多個 tensor 的「總 L2 norm」，需要先對每個 tensor 分別算 norm，然後平方加總，最後再開根號。
         for p_global, p_client in zip(global_model.parameters(), model.parameters()):
             p_client = p_client.to(global_device)
+            #p_global是 global model 的「某一層」的參數 tensor，p_client 是 client local model 的「相同層」參數 tensor。
             squared_diff += torch.norm(p_global.data - p_client.data, p=2).item() ** 2
         deltas.append(squared_diff ** 0.5)
-
+    #deltas 是一個 Python list，用來 收集每一個 client 訓練後的模型與 global 模型之間的距離。
+    #因此最後 deltas 的長度 = client 數量；每一個元素 = 該 client 的「距離」。
     deltas = np.array(deltas)
 
     if method == 'zscore':
         mean = deltas.mean()
+        #std 是 deltas 的 標準差 (Standard Deviation)，數學定義是所有值與平均值差異的平方和的平方根除以樣本數，反映資料分散程度。
         std = deltas.std()
+        #np.abs(deltas - mean) 計算每個 client 距離與平均值的差距
         keep_mask = np.abs(deltas - mean) <= threshold * std if std != 0 else np.ones_like(deltas, dtype=bool)
-    elif method == 'iqr':
-        q1 = np.percentile(deltas, 25)
-        q3 = np.percentile(deltas, 75)
-        iqr = q3 - q1
-        lower_bound = q1 - threshold * iqr
-        upper_bound = q3 + threshold * iqr
-        keep_mask = (deltas >= lower_bound) & (deltas <= upper_bound)
     else:
         raise ValueError("未知過濾方式")
 
     all_filtered = not np.any(keep_mask)
     if all_filtered:
-        print("⚠️ 所有客戶端皆被判定為異常，將跳過過濾，使用所有 client 進行聚合")
+        print("⚠️ 所有客戶端皆被判定為異常，將跳過Z-score過濾，使用Kmeans聚類作為 fallback")
         return client_models, client_weights, True  # 保留 True 作為 fallback indicator
 
 
     filtered_models = [m for m, keep in zip(client_models, keep_mask) if keep]
     filtered_weights = [w for w, keep in zip(client_weights, keep_mask) if keep]
-    print(f"🧹 剔除 {len(client_models) - len(filtered_models)} 個異常 client 更新")
+    removed_indices = [i for i, keep in enumerate(keep_mask) if not keep]
+    print(f"🧹 Z-score剔除 {len(client_models) - len(filtered_models)} 個異常 client 更新 ")
+    print(f"剔除的 client indices: {removed_indices}")
     return filtered_models, filtered_weights, False
+
+def filter_outlier_clients_by_cluster(
+    global_model,
+    client_models,
+    client_weights,
+    num_clusters=2,
+):
+    import numpy as np
+    import torch
+    from sklearn.cluster import KMeans
+
+    global_device = next(global_model.parameters()).device
+    delta_vectors = []
+
+    # 1️⃣ 計算每個 client 的 delta 向量
+    for model in client_models:
+        delta = []
+        for p_global, p_client in zip(global_model.parameters(), model.parameters()):
+            delta_tensor = (p_client.to(global_device).data - p_global.data).view(-1)
+            delta.append(delta_tensor.cpu().numpy())
+        delta_vectors.append(np.concatenate(delta))
+
+    delta_vectors = np.stack(delta_vectors)
+
+    # 2️⃣ KMeans 聚類
+    kmeans = KMeans(n_clusters=num_clusters, random_state=0)
+    labels = kmeans.fit_predict(delta_vectors)
+
+    # 3️⃣ 計算每群的平均梯度 norm
+    cluster_norm_stats = []
+    for cluster_id in range(num_clusters):
+        cluster_points = delta_vectors[labels == cluster_id]
+        if len(cluster_points) == 0:
+            continue
+        norms = np.linalg.norm(cluster_points, axis=1)
+        mean_norm = np.mean(norms)
+        cluster_norm_stats.append((cluster_id, mean_norm, len(cluster_points)))
+
+    if not cluster_norm_stats:
+        print("⚠️ 所有群皆為空群，跳過過濾，保留所有 client")
+        return client_models, client_weights, True
+
+    # 4️⃣ 選擇平均 norm 最小的群
+    best_cluster, best_norm, best_size = min(cluster_norm_stats, key=lambda x: x[1])
+    print(f"✅ 平均梯度 norm 最小群: {best_cluster}, Mean Norm={best_norm:.4f}, Size={best_size}")
+
+    # 5️⃣ 過濾
+    keep_mask = np.array([label == best_cluster for label in labels])
+    filtered_models = [m for m, keep in zip(client_models, keep_mask) if keep]
+    filtered_weights = [w for w, keep in zip(client_weights, keep_mask) if keep]
+
+    if len(filtered_models) == 0:
+        print("⚠️ 過濾後無 client，跳過過濾，保留所有 client")
+        return client_models, client_weights, True
+
+    if len(filtered_models) < num_clusters:
+        print(f"⚠️ 過濾後 client 數({len(filtered_models)}) / num_clusters({num_clusters})")
+
+    print(f"🧹 梯度 norm 聚類剔除 {len(client_models) - len(filtered_models)} 個異常 client")
+    return filtered_models, filtered_weights, False
+
+def robust_filter_outlier_clients(
+    global_model,
+    client_models,
+    client_weights,
+    method='zscore',
+    threshold=2.5,
+    num_clusters=2
+):
+    global num_zscore_used, num_cluster_used  # 宣告使用全域變數
+
+    # 先執行 Z-score/IQR
+    filtered_models, filtered_weights, all_filtered = filter_outlier_clients(
+        global_model, client_models, client_weights,
+        method=method, threshold=threshold
+    )
+
+    if all_filtered:
+        # fallback 使用 cluster
+        print("🔁 啟動 fallback：改用 cluster-based filtering")
+        filtered_models, filtered_weights, _ = filter_outlier_clients_by_cluster(
+            global_model,
+            client_models,
+            client_weights,
+            num_clusters=num_clusters,
+        )
+        num_cluster_used += 1
+        return filtered_models, filtered_weights, True
+
+    else:
+        num_zscore_used += 1
+        return filtered_models, filtered_weights, False
+
+# =========================
+# ✅ 3️⃣ 提供統計查詢函式
+
+def get_filter_stats():
+    global num_zscore_used, num_cluster_used
+    return {
+        'filter_outlier_clients_used': num_zscore_used,
+        'filter_outlier_clients_by_cluster_used': num_cluster_used
+    }
+
+def print_filter_stats():
+    stats = get_filter_stats()
+    print("📊=== Outlier Filtering 使用次數統計 ===")
+    print(f"🔹 ZScore 使用次數: {stats['filter_outlier_clients_used']}")
+    print(f"🔹 KMeans 使用次數: {stats['filter_outlier_clients_by_cluster_used']}")
+    print("=======================================")
+
 
 def federated_learning(args: object, train_clients: list[object], test_clients: list[object], global_model: torch.nn.Module) -> None:
     """
@@ -117,7 +236,7 @@ def federated_learning(args: object, train_clients: list[object], test_clients: 
     wandb_log = {}
     model_eval(global_model, global_train_loader, wandb_log, 'train/')
     model_eval(global_model, global_test_loader , wandb_log, 'test/' )
-    wandb.log(wandb_log)
+    wandb.log(wandb_log, step=-1)
     
     # for MOON
     previous_features = None
@@ -175,6 +294,9 @@ def federated_learning(args: object, train_clients: list[object], test_clients: 
             num_malicious = min(3, max(2, num_clients // 4))
 
         malicious_indices = random.sample(range(num_clients), num_malicious)
+        if args.malicious == 'None':
+            # 如果 args.malicious 是 'None'，則不進行任何擾動
+            print("✅ 本輪無惡意客戶端")
         # -----------------------------------
         # ** 模擬惡意客戶端-多個的 - TurboSVM的** 較為平凡的惡意 (比較偵測不出來)
         if args.malicious == 'Weak':
@@ -197,6 +319,7 @@ def federated_learning(args: object, train_clients: list[object], test_clients: 
                             malicious_model.logits.weight.data = torch.clamp(malicious_model.logits.weight.data, -20, 20)
                         if hasattr(malicious_model.logits, 'bias'):
                             malicious_model.logits.bias.data = torch.clamp(malicious_model.logits.bias.data, -20, 20)
+            #記取母數是誰，顯示出資料分布，證明惡意客戶端的存在，是否有被偵測到
             print(f"✅ 本輪惡意客戶端 indices: {malicious_indices}")
         # ** 模擬惡意客戶端-多個的 - TurboSVM的**
         # -----------------------------------
@@ -244,8 +367,8 @@ def federated_learning(args: object, train_clients: list[object], test_clients: 
         while continue_training and (args.switch_FL == 'FedEFC' or args.switch_FL == 'FedGMMDBACG'):
             # 全局模型聚合
             # ✅ 在聚合前移除異常更新(梯度爆炸的class去除)
-            client_models, client_weights, all_filtered = filter_outlier_clients(
-                global_model, client_models, client_weights, method='zscore', threshold=2.5
+            client_models, client_weights, all_filtered = robust_filter_outlier_clients(
+                global_model, client_models, client_weights
             )
 
             # 步驟 8：模型聚合與更新
@@ -254,8 +377,8 @@ def federated_learning(args: object, train_clients: list[object], test_clients: 
                 global_model, client_models, client_weights,  # 基本聯邦學習參數
                 global_optim,  # 用於 FedOpt（FedAdam 和 FedAMS）
                 logits_optim,  # 用於 FedAwS 和 TurboSVM
-                current_global_epoch, args.global_epoch, args.class_C, args.base_agg, args.agg_svc, args.spreadout,  # 用於 TurboSVM
-                args.cluster_method, args.num_clusters, args.dbscan_eps, args.dbscan_num_sample, args.client_epoch,  # 用於 FedGMMDBACG
+                current_global_epoch,  args.class_C, args.base_agg, args.agg_svc, args.spreadout,  # 用於 TurboSVM
+                args.cluster_method, args.num_clusters, args.dbscan_eps, args.dbscan_num_sample, args.client_epoch,  args.global_epoch,# 用於 FedGMMDBACG
             )
             # 步驟 9：穩定性處理
             # 穩定性處理，使用 torch.nan_to_num_ 來將模型參數中的 NaN 或無窮大值替換為合理的數值。
@@ -268,7 +391,7 @@ def federated_learning(args: object, train_clients: list[object], test_clients: 
             labels, preds = model_eval(global_model, global_train_loader, wandb_log, 'train/', True)
             acc = accuracy_score(preds.argmax(axis=1), labels)
             history_acc.append(acc)
-
+            print_filter_stats()
             # 結束訓練
             break
 
@@ -280,7 +403,7 @@ def federated_learning(args: object, train_clients: list[object], test_clients: 
         model_eval(global_model, global_train_loader, wandb_log, 'train/')
         model_eval(global_model, global_test_loader , wandb_log, 'test/' )
         wandb_log['epoch_train_times'] = epoch_train_times
-        wandb.log(wandb_log)
+        wandb.log(wandb_log, step=current_global_epoch)
        
     # global_model.to('cpu')
     # wandb.finish()
@@ -502,7 +625,7 @@ def FedEFC(global_model: torch.nn.Module,
            global_optim: torch.optim, 
            logits_optim: torch.optim, 
            current_global_epoch: int, 
-           num_global_epoch: int, 
+        #    num_global_epoch: int, 
            class_C: int | float, 
            base_agg: str, 
            agg_svc: bool, 
@@ -511,6 +634,8 @@ def FedEFC(global_model: torch.nn.Module,
            num_clusters: int,
            dbscan_eps: int | float,
            dbscan_num_sample: int,
+           client_epoch: int,  # 每個客戶端的訓練輪數
+           global_epoch: int,  # 全局訓練輪數
            # 新增高斯混合模型參數
            gmm_num_clusters: int = 2,  # 默認聚類數量為 2
            gmm_covariance_type: str = 'full',  # 默認設為 'full'
@@ -519,7 +644,7 @@ def FedEFC(global_model: torch.nn.Module,
            covariance_type: str = 'full',  # 默認設為 'full'
            tol: float = 1e-3,  # 默認容忍誤差為 1e-3
            max_iter: int = 100,  # 默認最大迭代次數為 100
-           random_state: int = 0  # 默認隨機種子
+           random_state: int = 0,  # 默認隨機種子
            ) -> None:
     # 這裡是函數體，會根據具體需求執行相應的操作
 
@@ -712,11 +837,6 @@ def FedEFC(global_model: torch.nn.Module,
             iso_labels = iso_forest.predict(x_scaled)
             iso_pass = (iso_labels == 1)  # 標記為正常的 client
 
-            # 訓練 LOF (Local Outlier Factor)
-            lof = LocalOutlierFactor(n_neighbors=20, contamination=0.1)
-            lof_labels = lof.fit_predict(x_scaled)
-            lof_pass = (lof_labels == 1)  # 標記為正常的 client 
-
             # 進一步的 DBSCAN 檢測
             dbscan = DBSCAN(eps=dbscan_eps, min_samples=dbscan_num_sample)
             dbscan_labels = dbscan.fit_predict(x_scaled)
@@ -724,14 +844,12 @@ def FedEFC(global_model: torch.nn.Module,
             # DBSCAN 噪聲標籤 -1 代表噪聲
             dbscan_valid = (dbscan_labels != -1)  # 只保留非噪聲點
             dbscan_valid_indices = np.where(dbscan_valid)[0].tolist()
-            print(f"\n🐝 DBSCAN 有效 clients indices: {dbscan_valid_indices}")
-            print("------------------------------------------------------------")
 
             # 最後的有效 client 條件：所有條件滿足才是有效
             if(dbscan_valid.sum() <= class_C/2):
-                valid_clients = gmm_valid & norm_pass & iso_pass & lof_pass
+                valid_clients = gmm_valid & norm_pass & iso_pass
             else:
-                valid_clients = gmm_valid & dbscan_valid & norm_pass & iso_pass & lof_pass
+                valid_clients = gmm_valid & dbscan_valid & norm_pass & iso_pass
 
             # 後續處理
             filtered_client_models = [m for i, m in enumerate(client_models) if valid_clients[i]]
@@ -762,7 +880,6 @@ def FedEFC(global_model: torch.nn.Module,
             print(f"✅ GMM valid: {np.sum(gmm_valid)} / {len(gmm_valid)}")
             print(f"✅ Norm pass: {np.sum(norm_pass)} / {len(norm_pass)}")
             print(f"✅ ISO pass: {np.sum(iso_pass)} / {len(iso_pass)}")
-            print(f"✅ LOF pass: {np.sum(lof_pass)} / {len(lof_pass)}")
             print(f"✅ DBSCAN pass: {np.sum(dbscan_valid)} / {len(dbscan_valid)}")
 
         case 'GMMDBSCAN':
@@ -821,18 +938,10 @@ def FedEFC(global_model: torch.nn.Module,
             iso_labels = iso_forest.fit_predict(x_scaled)
             iso_pass = (iso_labels == 1)
 
-            # --- LOF ---
-            lof = LocalOutlierFactor(n_neighbors=20, contamination=0.1)
-            lof_labels = lof.fit_predict(x_scaled)
-            lof_pass = (lof_labels == 1)
-
             # --- DBSCAN ---
             dbscan = DBSCAN(eps=dbscan_eps, min_samples=dbscan_num_sample)
             dbscan_labels = dbscan.fit_predict(x_scaled)
             dbscan_valid = (dbscan_labels != -1)
-
-            print(f"🐝 DBSCAN 有效 clients indices: {np.where(dbscan_valid)[0].tolist()}")
-            print("------------------------------------------------------------")
 
         case _:
             raise Exception(f"Invalid cluster_method: {cluster_method}")
@@ -890,7 +999,7 @@ def FedGMMDBACG(global_model: torch.nn.Module,
            global_optim: torch.optim, 
            logits_optim: torch.optim, 
            current_global_epoch: int, 
-           num_global_epoch: int, 
+        #    num_global_epoch: int, 
            class_C: int | float, 
            base_agg: str, 
            agg_svc: bool, 
@@ -899,6 +1008,8 @@ def FedGMMDBACG(global_model: torch.nn.Module,
            num_clusters: int,
            dbscan_eps: int | float,
            dbscan_num_sample: int,
+           client_epoch: int,  # 每個客戶端的訓練輪數
+           global_epoch: int,  # 全局訓練輪數
            # 新增高斯混合模型參數
            gmm_num_clusters: int = 2,  # 默認聚類數量為 2
            gmm_covariance_type: str = 'full',  # 默認設為 'full'
@@ -908,7 +1019,6 @@ def FedGMMDBACG(global_model: torch.nn.Module,
            tol: float = 1e-3,  # 默認容忍誤差為 1e-3
            max_iter: int = 100,  # 默認最大迭代次數為 100
            random_state: int = 0,  # 默認隨機種子
-           client_epoch: int = 2,  # 每個客戶端的訓練輪數
            ) -> None:
     # 這裡是函數體，會根據具體需求執行相應的操作
 
@@ -985,50 +1095,6 @@ def FedGMMDBACG(global_model: torch.nn.Module,
             valid_clients = (labels == majority_cluster)
             fallback_valid_clients = np.zeros(len(client_models), dtype=bool)
 
-        case 'GaussianMixture':
-            print("Running GaussianMixture...")
-            # 使用 GaussianMixture 聚類
-            scaler = StandardScaler()
-            x_scaled = scaler.fit_transform(x)
-            
-            gmm = GaussianMixture(
-                n_components=gmm_num_clusters,
-                covariance_type=gmm_covariance_type,
-                tol=gmm_tol,
-                max_iter=gmm_max_iter,
-                random_state=random_state
-            )
-            gmm.fit(x_scaled)
-
-            means = gmm.means_
-            covariances = gmm.covariances_
-            probs = gmm.predict_proba(x_scaled)
-
-            # 計算每個群集的集中度（協方差的行列式或對角線元素之和）
-            concentration = np.array([np.sum(np.diagonal(cov)) for cov in covariances])
-            threshold = 0.5
-            max_prob = np.max(probs, axis=1)
-            valid_samples = max_prob >= threshold
-
-            # 篩選出高可信度樣本的標籤
-            x_filtered = x_scaled[valid_samples]
-            labels_filtered = gmm.predict(x_filtered)
-
-            # 找出協方差小的可信群集
-            good_clusters = concentration < np.percentile(concentration, 50)
-            good_cluster_labels = np.where(good_clusters)[0]
-
-            # 初始化為全 False
-            valid_clients = np.zeros(len(client_models), dtype=bool)
-
-            # 將原始樣本中屬於可信群集的且通過隸屬度閾值的 client 標為 True
-            valid_indices = np.where(valid_samples)[0]
-            for idx, cluster_label in zip(valid_indices, labels_filtered):
-                if cluster_label in good_cluster_labels:
-                    valid_clients[idx] = True
-
-            fallback_valid_clients = np.zeros(len(client_models), dtype=bool)
-
         case 'HDBSCAN':
             # 對數據進行標準化處理
             scaler = StandardScaler()
@@ -1049,7 +1115,274 @@ def FedGMMDBACG(global_model: torch.nn.Module,
             valid_clients = np.ones(len(client_models), dtype=bool)
             fallback_valid_clients = np.zeros(len(client_models), dtype=bool)
 
+        #未有GMM
+        case 'DBSCANISO':
+            print("Running DBSCANISO...")
+            scaler = StandardScaler()
+            x_raw = np.array([np.concatenate([p.data.cpu().numpy().flatten() for p in m.parameters()]) for m in client_models])
+            x_scaled = scaler.fit_transform(x_raw)
+            # step 2. PCA 降維
+            pca_dim = min(10, x_scaled.shape[0], x_scaled.shape[1])
+            if x_scaled.shape[1] > pca_dim:
+                pca = PCA(n_components=pca_dim)
+                x_scaled = pca.fit_transform(x_scaled)
+
+            valid_clients = np.full(len(x_scaled), True)  # 預設全部 valid
+            labels = np.full(len(x_scaled), -1)
+
+            # 訓練 Isolation Forest 模型
+            iso_forest = IsolationForest(n_estimators=100, contamination=0.1, random_state=random_state)
+            iso_forest.fit(x_scaled)
+            iso_labels = iso_forest.predict(x_scaled)
+            iso_pass = (iso_labels == 1)  # 標記為正常的 client
+
+            # step 6. DBSCAN 檢測：使用 DBSCAN 進行進一步的異常檢測，這部分將數據分為不同的簇，並將噪聲點標記為 -1。這是用來檢測是否存在異常數據點。
+            # 進一步的 DBSCAN 檢測
+            dbscan = DBSCAN(eps=dbscan_eps, min_samples=dbscan_num_sample)
+            dbscan_labels = dbscan.fit_predict(x_scaled)
+
+            # DBSCAN 噪聲標籤 -1 代表噪聲
+            dbscan_valid = (dbscan_labels != -1)  # 只保留非噪聲點
+
+            # step 7. 最後的有效 client 條件：綜合多重條件篩選有效客戶端：這些條件包括 GMM 聚類、DBSCAN、Mahalanobis 距離、Isolation Forest、LOF 和其他異常檢測條件。
+            # 最後的有效 client 條件：所有條件滿足才是有效
+            if dbscan_valid.sum() > len(client_models) / 2:
+                valid_clients = dbscan_valid & iso_pass
+            else:
+                valid_clients = iso_pass 
+
+            # 後續處理
+            filtered_client_models = [m for i, m in enumerate(client_models) if valid_clients[i]]
+            filtered_client_weights = [w for i, w in enumerate(client_weights) if valid_clients[i]]
+
+            if len(filtered_client_models) > 0:
+                print("🔁 使用 valid clients 更新 global model")
+                eval(base_agg)(global_model, filtered_client_models, filtered_client_weights, global_optim)
+
+            removed_indices = np.where(~valid_clients)[0].tolist()
+            remove_dbscan = np.where(~dbscan_valid)[0].tolist()
+            remove_iso = np.where(~iso_pass)[0].tolist()
+            print(f"❌ 本輪被篩除的 clients indices: {removed_indices}")
+
+            print(f"✅ Valid clients: {np.sum(valid_clients)} / {len(client_models)}")
+            print(f"✅ DBSCAN valid: {np.sum(dbscan_valid)} / {len(dbscan_valid)}")
+            print(f"❌ 本輪被篩除的 DBSCAN: {remove_dbscan}")
+            print(f"✅ ISO pass: {np.sum(iso_pass)} / {len(iso_pass)}")
+            print(f"❌ 本輪被篩除的 ISO: {remove_iso}")
+
+        #未有DBSCAN
+        case 'GaussianMixtureISO':
+            print("Running GaussianMixture...")
+            scaler = StandardScaler()
+            x_raw = np.array([np.concatenate([p.data.cpu().numpy().flatten() for p in m.parameters()]) for m in client_models])
+            x_scaled = scaler.fit_transform(x_raw)
+            # step 2. PCA 降維
+            pca_dim = min(10, x_scaled.shape[0], x_scaled.shape[1])
+            if x_scaled.shape[1] > pca_dim:
+                pca = PCA(n_components=pca_dim)
+                x_scaled = pca.fit_transform(x_scaled)
+
+            valid_clients = np.full(len(x_scaled), True)  # 預設全部 valid
+            labels = np.full(len(x_scaled), -1)
+
+            # step 3. GMM 聚類
+            gmm = GaussianMixture(
+                n_components=min(gmm_num_clusters, len(x_scaled) // 2),
+                covariance_type=gmm_covariance_type,
+                tol=gmm_tol,
+                max_iter=gmm_max_iter,
+                random_state=random_state
+            )
+            gmm.fit(x_scaled)
+            gmm_labels = gmm.predict(x_scaled)
+            probs = gmm.predict_proba(x_scaled)
+            max_prob = np.max(probs, axis=1)
+            print("📊 GMM label 分佈:", np.bincount(gmm_labels))
+
+            counts = np.bincount(gmm_labels)
+            majority_cluster = np.argmax(counts)
+
+            in_majority = (gmm_labels == majority_cluster)
+
+            prob_threshold = np.median(max_prob[in_majority])
+            prob_pass = (max_prob >= prob_threshold)
+
+            def mahalanobis_dist(x, mean, cov_inv):
+                return distance.mahalanobis(x, mean, cov_inv)
+
+            distances = np.array([
+                mahalanobis_dist(x_scaled[i], gmm.means_[gmm_labels[i]], np.linalg.inv(gmm.covariances_[gmm_labels[i]]))
+                for i in range(len(x_scaled))
+            ])
+
+            z_pass = distances < np.percentile(distances, 90)  # 保留前 90% 接近的客戶端
+
+            gmm_valid = in_majority & prob_pass & z_pass
+
+            # step 5.  Isolation Forest 和 LOF 進行異常檢測，額外異常檢測： 使用 Isolation Forest 和 Local Outlier Factor（LOF）進行進一步的異常偵測，這些方法能夠檢測到離群的數據點，並將其標記為異常。
+            # 訓練 Isolation Forest 模型
+            iso_forest = IsolationForest(n_estimators=100, contamination=0.1, random_state=random_state)
+            iso_forest.fit(x_scaled)
+            iso_labels = iso_forest.predict(x_scaled)
+            iso_pass = (iso_labels == 1)  # 標記為正常的 client
+
+            valid_clients = gmm_valid & iso_pass 
+
+            # 後續處理
+            filtered_client_models = [m for i, m in enumerate(client_models) if valid_clients[i]]
+            filtered_client_weights = [w for i, w in enumerate(client_weights) if valid_clients[i]]
+
+            if len(filtered_client_models) > 0:
+                print("🔁 使用 valid clients 更新 global model")
+                eval(base_agg)(global_model, filtered_client_models, filtered_client_weights, global_optim)
+            # 若是沒有有效的可使用客戶端則進行 以下操作
+            else:
+                print("⚠️ 沒有 valid clients，改採用 GMM 最大群集進行 fallback 聚合")
+                # step 1. fallback：選擇 GMM 最大群集作為 valid_clients
+                counts = np.bincount(gmm_labels)
+                majority_cluster = np.argmax(counts)
+                fallback_valid_clients = (gmm_labels == majority_cluster)
+
+                # step 2. 使用 fallback valid clients
+                filtered_client_models = [m for i, m in enumerate(client_models) if fallback_valid_clients[i]]
+                filtered_client_weights = [w for i, w in enumerate(client_weights) if fallback_valid_clients[i]]
+                
+                # step 3. 最終過濾與更新： 在過濾出有效的客戶端後，使用修剪平均方法對客戶端模型進行聚合，並更新全局模型。
+                if len(filtered_client_models) > 0:
+                    print("🔁 使用 fallback clients 更新 global model")
+                    eval(base_agg)(global_model, filtered_client_models, filtered_client_weights, global_optim)
+                    x, y, w = [], [], []
+                    for m, cw in zip(filtered_client_models, filtered_client_weights):
+                        wb = torch.cat((m.logits.weight[classes], m.logits.bias[classes].view(-1, 1)), axis=1).detach()
+                        x.append(wb)
+                        y += classes
+                        w += [cw] * len(classes)
+                    x = torch.cat(x)
+                    labels = np.zeros(len(x), dtype=int)
+
+                else:
+                    print("⛔ fallback 聚合也失敗，跳過這一輪")
+
+            removed_indices = np.where(~valid_clients)[0].tolist()
+            remove_GMM = np.where(~gmm_valid)[0].tolist()
+            remove_iso = np.where(~iso_pass)[0].tolist()
+            print(f"❌ 本輪被篩除的 clients indices: {removed_indices}")
+
+            print(f"✅ Valid clients: {np.sum(valid_clients)} / {len(client_models)}")
+            print(f"✅ GMM valid: {np.sum(gmm_valid)} / {len(gmm_valid)}")
+            print(f"❌ 本輪被篩除的 remove_GMM: {remove_GMM}")
+            print(f"✅ ISO pass: {np.sum(iso_pass)} / {len(iso_pass)}")
+            print(f"❌ 本輪被篩除的 ISO: {remove_iso}")
+        # 未有ISO
         case 'GaussianMixtureDBSCAN':
+            print("Running GMM-only anomaly detection...")
+            scaler = StandardScaler()
+            x_raw = np.array([np.concatenate([p.data.cpu().numpy().flatten() for p in m.parameters()]) for m in client_models])
+            x_scaled = scaler.fit_transform(x_raw)
+            pca_dim = min(10, x_scaled.shape[0], x_scaled.shape[1])
+            if x_scaled.shape[1] > pca_dim:
+                pca = PCA(n_components=pca_dim)
+                x_scaled = pca.fit_transform(x_scaled)
+
+            valid_clients = np.full(len(x_scaled), True)  # 預設全部 valid
+            labels = np.full(len(x_scaled), -1)
+
+            # step 3. GMM 聚類：使用高斯混合模型（GMM）對客戶端模型進行聚類，通過計算每個模型屬於某一群集的機率，選擇出屬於主群集的模型。這是用來檢測是否存在異常數據點。
+            gmm = GaussianMixture(
+                n_components=min(gmm_num_clusters, len(x_scaled) // 2),
+                covariance_type=gmm_covariance_type,
+                tol=gmm_tol,
+                max_iter=gmm_max_iter,
+                random_state=random_state
+            )
+            gmm.fit(x_scaled)
+            gmm_labels = gmm.predict(x_scaled)
+            probs = gmm.predict_proba(x_scaled)
+            max_prob = np.max(probs, axis=1)
+            print("📊 GMM label 分佈:", np.bincount(gmm_labels))
+
+            counts = np.bincount(gmm_labels)
+            majority_cluster = np.argmax(counts)
+
+            in_majority = (gmm_labels == majority_cluster)
+
+            prob_threshold = np.median(max_prob[in_majority])
+            prob_pass = (max_prob >= prob_threshold)
+
+            def mahalanobis_dist(x, mean, cov_inv):
+                return distance.mahalanobis(x, mean, cov_inv)
+
+            distances = np.array([
+                mahalanobis_dist(x_scaled[i], gmm.means_[gmm_labels[i]], np.linalg.inv(gmm.covariances_[gmm_labels[i]]))
+                for i in range(len(x_scaled))
+            ])
+            z_pass = distances < np.percentile(distances, 90)  # 保留前 90% 接近的客戶端
+
+            gmm_valid = in_majority & prob_pass & z_pass
+
+            dbscan = DBSCAN(eps=dbscan_eps, min_samples=dbscan_num_sample)
+            dbscan_labels = dbscan.fit_predict(x_scaled)
+
+            # DBSCAN 噪聲標籤 -1 代表噪聲
+            dbscan_valid = (dbscan_labels != -1)  # 只保留非噪聲點
+            dbscan_valid_indices = np.where(dbscan_valid)[0].tolist()
+
+            # step 7. 最後的有效 client 條件：綜合多重條件篩選有效客戶端：這些條件包括 GMM 聚類、DBSCAN、Mahalanobis 距離、Isolation Forest、LOF 和其他異常檢測條件。
+            # 最後的有效 client 條件：所有條件滿足才是有效
+            if dbscan_valid.sum() > len(client_models) / 2:
+                valid_clients = gmm_valid & dbscan_valid
+            else:
+                valid_clients = gmm_valid
+
+            # 後續處理
+            filtered_client_models = [m for i, m in enumerate(client_models) if valid_clients[i]]
+            filtered_client_weights = [w for i, w in enumerate(client_weights) if valid_clients[i]]
+
+            if len(filtered_client_models) > 0:
+                print("🔁 使用 valid clients 更新 global model")
+                eval(base_agg)(global_model, filtered_client_models, filtered_client_weights, global_optim)
+            # 若是沒有有效的可使用客戶端則進行 以下操作
+            else:
+                print("⚠️ 沒有 valid clients，改採用 GMM 最大群集進行 fallback 聚合")
+                # step 1. fallback：選擇 GMM 最大群集作為 valid_clients
+                counts = np.bincount(gmm_labels)
+                majority_cluster = np.argmax(counts)
+                fallback_valid_clients = (gmm_labels == majority_cluster)
+
+                # step 2. 使用 fallback valid clients
+                filtered_client_models = [m for i, m in enumerate(client_models) if fallback_valid_clients[i]]
+                filtered_client_weights = [w for i, w in enumerate(client_weights) if fallback_valid_clients[i]]
+                
+                # step 3. 最終過濾與更新： 在過濾出有效的客戶端後，使用修剪平均方法對客戶端模型進行聚合，並更新全局模型。
+                if len(filtered_client_models) > 0:
+                    print("🔁 使用 fallback clients 更新 global model")
+                    eval(base_agg)(global_model, filtered_client_models, filtered_client_weights, global_optim)
+                    x, y, w = [], [], []
+                    for m, cw in zip(filtered_client_models, filtered_client_weights):
+                        wb = torch.cat((m.logits.weight[classes], m.logits.bias[classes].view(-1, 1)), axis=1).detach()
+                        x.append(wb)
+                        y += classes
+                        w += [cw] * len(classes)
+                    x = torch.cat(x)
+                    labels = np.zeros(len(x), dtype=int)  # fallback 時可統一視為同一簇
+
+                else:
+                    print("⛔ fallback 聚合也失敗，跳過這一輪")
+
+            remove_GMM = np.where(~gmm_valid)[0].tolist()
+            remove_dbscan = np.where(~dbscan_valid)[0].tolist()
+
+            # --- 統計與輸出 ---
+            # 消溶實驗、證明GM、DBSCAN等方法的有效性
+            removed_indices = np.where(~valid_clients)[0].tolist()
+            print(f"❌ 本輪被篩除的 clients indices: {removed_indices}")
+            print(f"✅ Valid clients: {np.sum(valid_clients)} / {len(client_models)}")
+            print(f"✅ GMM valid: {np.sum(gmm_valid)} / {len(gmm_valid)}")
+            print(f"❌ 本輪被篩除的 remove_GMM: {remove_GMM}")
+            print(f"✅ DBSCAN pass: {np.sum(dbscan_valid)} / {len(dbscan_valid)}")
+            print(f"❌ 本輪被篩除的 DBSCAN: {remove_dbscan}")
+        # All have
+        case 'GaussianMixtureDBSCANISO':
             print("Running GMM-only anomaly detection...")
 
             # 高斯混合模型（GMM）初始化與篩選
@@ -1068,7 +1401,7 @@ def FedGMMDBACG(global_model: torch.nn.Module,
 
             # step 3. GMM 聚類：使用高斯混合模型（GMM）對客戶端模型進行聚類，通過計算每個模型屬於某一群集的機率，選擇出屬於主群集的模型。這是用來檢測是否存在異常數據點。
             gmm = GaussianMixture(
-                n_components=min(gmm_num_clusters, len(x_scaled) // 2),
+                n_components=max(2, min(gmm_num_clusters, len(x_scaled)//2)),
                 covariance_type=gmm_covariance_type,
                 tol=gmm_tol,
                 max_iter=gmm_max_iter,
@@ -1102,8 +1435,6 @@ def FedGMMDBACG(global_model: torch.nn.Module,
                 mahalanobis_dist(x_scaled[i], gmm.means_[gmm_labels[i]], np.linalg.inv(gmm.covariances_[gmm_labels[i]]))
                 for i in range(len(x_scaled))
             ])
-            # z_scores = (distances - np.mean(distances)) / np.std(distances)
-            # z_pass = np.abs(z_scores) < 1  # Z-score 小於 1（更合理界定）
             z_pass = distances < np.percentile(distances, 90)  # 保留前 90% 接近的客戶端
 
             # 來自 GMM 分群的分析結果。
@@ -1114,23 +1445,12 @@ def FedGMMDBACG(global_model: torch.nn.Module,
             # 🎯 GMM 最終 valid clients
             gmm_valid = in_majority & prob_pass & z_pass
             
-            # 額外加入 weight norm 檢查（強化不一致異常偵測）
-            weight_norms = np.linalg.norm(x_scaled, axis=1)
-            norm_mean, norm_std = np.mean(weight_norms), np.std(weight_norms)
-            norm_z = (weight_norms - norm_mean) / norm_std
-            norm_pass = (np.abs(norm_z) < 2.5)
-
-            # step 5.  Isolation Forest 和 LOF 進行異常檢測，額外異常檢測： 使用 Isolation Forest 和 Local Outlier Factor（LOF）進行進一步的異常偵測，這些方法能夠檢測到離群的數據點，並將其標記為異常。
+            # step 5.  Isolation Forest 進行異常檢測，額外異常檢測： 使用 Isolation Forest 進行進一步的異常偵測，這些方法能夠檢測到離群的數據點，並將其標記為異常。
             # 訓練 Isolation Forest 模型
             iso_forest = IsolationForest(n_estimators=100, contamination=0.1, random_state=random_state)
             iso_forest.fit(x_scaled)
             iso_labels = iso_forest.predict(x_scaled)
             iso_pass = (iso_labels == 1)  # 標記為正常的 client
-
-            # 訓練 LOF (Local Outlier Factor)
-            lof = LocalOutlierFactor(n_neighbors=20, contamination=0.1)
-            lof_labels = lof.fit_predict(x_scaled)
-            lof_pass = (lof_labels == 1)  # 標記為正常的 client 
 
             # step 6. DBSCAN 檢測：使用 DBSCAN 進行進一步的異常檢測，這部分將數據分為不同的簇，並將噪聲點標記為 -1。這是用來檢測是否存在異常數據點。
             # 進一步的 DBSCAN 檢測
@@ -1139,20 +1459,13 @@ def FedGMMDBACG(global_model: torch.nn.Module,
 
             # DBSCAN 噪聲標籤 -1 代表噪聲
             dbscan_valid = (dbscan_labels != -1)  # 只保留非噪聲點
-            dbscan_valid_indices = np.where(dbscan_valid)[0].tolist()
-            print(f"\n🐝 DBSCAN 有效 clients indices: {dbscan_valid_indices}")
-            print("------------------------------------------------------------")
 
             # step 7. 最後的有效 client 條件：綜合多重條件篩選有效客戶端：這些條件包括 GMM 聚類、DBSCAN、Mahalanobis 距離、Isolation Forest、LOF 和其他異常檢測條件。
             # 最後的有效 client 條件：所有條件滿足才是有效
-            # valid_clients = gmm_valid & dbscan_valid & norm_pass & iso_pass & lof_pass
-            # 最後的有效 client 條件：所有條件滿足才是有效
-            if dbscan_valid.sum() > len(client_models) / 2:
-                valid_clients = gmm_valid & dbscan_valid & norm_pass & iso_pass & lof_pass
-            elif gmm_valid.sum() > len(client_models) / 2:
-                valid_clients = gmm_valid & norm_pass & iso_pass & lof_pass
+            if dbscan_valid.sum() >= len(client_models) / 2:
+                valid_clients = gmm_valid & dbscan_valid & iso_pass
             else:
-                valid_clients = norm_pass & iso_pass & lof_pass
+                valid_clients = gmm_valid & iso_pass
 
             # 後續處理
             filtered_client_models = [m for i, m in enumerate(client_models) if valid_clients[i]]
@@ -1189,66 +1502,21 @@ def FedGMMDBACG(global_model: torch.nn.Module,
 
                 else:
                     print("⛔ fallback 聚合也失敗，跳過這一輪")
-
-            # --- 計算出向量，使其不要有非典型梯度主導全局模型的情況---
-            # --- 🧠 計算每個 client 的 gradient 向量與 global gradient 的 cosine similarity ---
-            def model_to_vector(model, device=None):
-                if device is None:
-                    device = next(model.parameters()).device
-                return torch.cat([p.data.view(-1).to(device) for p in model.parameters()])
-
-            # global_vec = model_to_vector(global_model)
-
-            # client_grads = []
-            # cosine_similarities = []
-            # # step 8.  計算並篩選梯度相似度：計算每個客戶端模型與全局模型的梯度向量之間的餘弦相似度，過濾掉與全局模型梯度差異過大的客戶端。
-            # for m in client_models:
-            #     client_vec = model_to_vector(m, device=global_vec.device)
-            #     grad_vec = client_vec - global_vec  # 近似 gradient
-            #     client_grads.append(grad_vec)
-            #     cos_sim = 1 - cosine(global_vec.cpu().numpy(), grad_vec.cpu().numpy())
-            #     cosine_similarities.append(cos_sim)
-
-            # # --- 🔍 使用百分位方式過濾 cosine similarity 太低的 client ---
-            # cos_threshold = np.percentile(cosine_similarities, 20)  # bottom 20% 視為異常
-            # cos_valid = np.array(cosine_similarities) >= cos_threshold
-            # print(f"🧭 Gradient Cosine Similarity threshold: {cos_threshold:.4f}")
-            # print(f"✅ Cosine pass: {np.sum(cos_valid)} / {len(cos_valid)}")
-
-            # # --- ✅ 最終有效 clients 結合所有條件 ---
-            # valid_clients = valid_clients & cos_valid
-
-            # --- 🧮 Trimmed Mean 聚合（防止極端值影響） ---
-            # step 8. 使用 trimmed mean 聚合：這部分將所有有效的 client 模型進行 trimmed mean 聚合
-            # 修剪平均聚合： 使用修剪平均（trimmed mean）方法進行聚合，這樣可以減少極端值對最終模型的影響。這是用來處理訓練過程中可能出現的噪聲或異常數據。
-            if np.sum(valid_clients) > 0:
-                print("📈 使用 trimmed mean 聚合")
-                valid_models = [m for i, m in enumerate(client_models) if valid_clients[i]]
-                # 將所有模型轉成向量形式
-                model_vecs = torch.stack([model_to_vector(m) for m in valid_models])
-                
-                # 每個參數位置取 trimmed mean（剃除 top/bottom 10%）
-                trimmed = trim_mean(model_vecs.numpy(), proportiontocut=0.1, axis=0)
-                # 回傳到模型參數中（需要重建模型）
-                offset = 0
-                with torch.no_grad():
-                    for p in global_model.parameters():
-                        numel = p.data.numel()
-                        p.data.copy_(torch.tensor(trimmed[offset:offset + numel]).view_as(p.data))
-                        offset += numel
-            else:
-                print("⛔ 沒有 valid clients 通過 cosine 過濾")
-
+            
+            remove_iso = np.where(~iso_pass)[0].tolist()
+            remove_GMM = np.where(~gmm_valid)[0].tolist()
+            remove_dbscan = np.where(~dbscan_valid)[0].tolist()
+            # --- 統計與輸出 ---
+            # 消溶實驗、證明GM、ISO、DBSCAN等方法的有效性
             removed_indices = np.where(~valid_clients)[0].tolist()
             print(f"❌ 本輪被篩除的 clients indices: {removed_indices}")
-
             print(f"✅ Valid clients: {np.sum(valid_clients)} / {len(client_models)}")
             print(f"✅ GMM valid: {np.sum(gmm_valid)} / {len(gmm_valid)}")
-            print(f"✅ Norm pass: {np.sum(norm_pass)} / {len(norm_pass)}")
+            print(f"❌ 本輪被篩除的 remove_GMM: {remove_GMM}")
             print(f"✅ ISO pass: {np.sum(iso_pass)} / {len(iso_pass)}")
-            print(f"✅ LOF pass: {np.sum(lof_pass)} / {len(lof_pass)}")
+            print(f"❌ 本輪被篩除的 ISO: {remove_iso}")
             print(f"✅ DBSCAN pass: {np.sum(dbscan_valid)} / {len(dbscan_valid)}")
-
+            print(f"❌ 本輪被篩除的 DBSCAN: {remove_dbscan}")
         case _:
             raise Exception(f"Invalid cluster_method: {cluster_method}")
         
@@ -1300,12 +1568,14 @@ def FedGMMDBACG(global_model: torch.nn.Module,
                 # 輸入：num_clients_total（N）
 
                 # step 3. 使用 weighted_avg_with_momentum_ACG 函數做聚合
-                # 正常執行更新
+                # 正常執行更新                    
                 updated = weighted_avg_with_momentum_ACG(
                     logits_values, logits_weights, c, global_model,
-                    current_round=current_global_epoch,  # 👈 記得傳進來！
+                    current_round=current_global_epoch,  # 👈 輪次
                     min_clients_threshold = max(7, int(len(client_models) * 1/2)),  # 👈 設定最小客戶端數量
                     local_epoch=client_epoch, 
+                    total_clients=len(client_models),
+                    global_epoch = global_epoch, #總輪次
                 )
                 global_model.logits.weight[c].copy_(updated[:-1])
                 global_model.logits.bias[c].copy_(updated[-1])
