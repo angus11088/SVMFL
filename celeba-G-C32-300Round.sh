@@ -38,7 +38,7 @@ do
                                             #     continue
                                             # fi
                                             # python main_FL.py -p $project -fl FedEFC -C $c -E $e -M $Method -eps $eps -global_epoch 500 -num_sample $num_sample
-                                            nohup python main_FL.py -p $project -fl FedGMMDBACG  -C $c -E $e -M $Method -eps $eps -global_epoch 300 -num_sample $num_sample --gmm_num_clusters $gmm_num_clusters --gmm_covariance_type $gmm_covariance_type --gmm_tol $gmm_tol --gmm_max_iter $gmm_max_iter --gmm_random_state $gmm_random_state> output/output_${project}_${Method}_${e}_${c}_${eps}_${num_sample}_${gmm_num_clusters}_${gmm_covariance_type}_${gmm_tol}_${gmm_max_iter}_${gmm_random_state}.log 2>&1
+                                            nohup python main_FL.py -p $project -fl FedGMMDBACG  -C $c -E $e -M $Method -eps $eps -global_epoch 301 -num_sample $num_sample --gmm_num_clusters $gmm_num_clusters --gmm_covariance_type $gmm_covariance_type --gmm_tol $gmm_tol --gmm_max_iter $gmm_max_iter --gmm_random_state $gmm_random_state> output/output_${project}_${Method}_${e}_${c}_${eps}_${num_sample}_${gmm_num_clusters}_${gmm_covariance_type}_${gmm_tol}_${gmm_max_iter}_${gmm_random_state}.log 2>&1
                                             wait
                                         done
                                     done

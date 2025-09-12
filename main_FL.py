@@ -24,8 +24,8 @@ def main_FL(args: object):
 
     # wandb init
     # wandb.init(project = args.project, name = args.name, config = args.__dict__, anonymous = "allow")
-    wandb.init(project = 'FL1811232016', name = args.name, config = args.__dict__, anonymous = "allow")
-    
+    wandb.init(project = 'FL1811232016', name = args.name, config = args.__dict__, anonymous = "allow", mode="offline")#mode="offline"應該去除，使其可以記錄在wandb，由於學校網路無法ping到，則以本地紀錄代替
+
     # federated learning
     federated_learning(args, train_clients, test_clients, global_model)
     
@@ -45,13 +45,20 @@ if __name__ == '__main__':
     args.name += args.switch_FL + ': C ' + str(args.client_C) + ', E ' + str(args.client_epoch) + ', '
     match args.switch_FL:
         case 'FedAvg' | 'FedProx' | 'MOON':
+            args.name += 'dataset: ' + str(args.project) + ','
             args.name += str(args.client_optim).split('.')[-1][:-2] + ' ' + str(args.client_lr)
+            args.name += 'malicious: ' + str(args.malicious) + ','
         case 'FedAdam' | 'FedAMS':
+            args.name += 'dataset: ' + str(args.project) + ','
             args.name += str(args.global_optim).split('.')[-1][:-2] + ' ' + str(args.global_lr)
+            args.name += 'malicious: ' + str(args.malicious) + ','
         case 'FedAwS' | 'TurboSVM':
+            args.name += 'dataset: ' + str(args.project) + ','
             args.name += str(args.logits_optim).split('.')[-1][:-2] + ' ' + str(args.logits_lr)
+            args.name += 'malicious: ' + str(args.malicious) + ','
         case 'FedEFC':
             args.name += 'Method: ' + str(args.cluster_method) + ','
+            args.name += 'dataset: ' + str(args.project) + ','
             if args.cluster_method == 'KMeans' or args.cluster_method == 'KMedoids':
                 args.name += 'K: ' + str(args.num_clusters) + ','
             elif args.cluster_method == 'DBSCAN':
@@ -81,6 +88,7 @@ if __name__ == '__main__':
             args.name += str(args.logits_optim).split('.')[-1][:-2] + ' ' + str(args.logits_lr)
         case 'FedGMMDBACG':
             args.name += 'Method: ' + str(args.cluster_method) + ','
+            args.name += 'dataset: ' + str(args.project) + ','
             if args.cluster_method == 'KMeans' or args.cluster_method == 'KMedoids':
                 args.name += 'K: ' + str(args.num_clusters) + ','
             elif args.cluster_method == 'DBSCAN':
@@ -90,23 +98,17 @@ if __name__ == '__main__':
                 args.name += 'min_cluster_size: ' + str(args.hdbscan_min_cluster_size) + ','
             elif args.cluster_method == 'GaussianMixture':
                 args.name += 'K: ' + str(args.num_clusters) + ','  # 添加GaussianMixture的num_clusters參數
+            elif args.cluster_method == 'GaussianMixtureDBSCANISO':
+               args.name += 'round: ' + str(args.global_epoch) + ','
+               args.name += 'malicious: ' + str(args.malicious) + ','
             elif args.cluster_method == 'GaussianMixtureDBSCAN':
-                args.name += 'gmm_num_clusters: ' + str(args.gmm_num_clusters) + ','
-                args.name += 'gmm_covariance_type: ' + str(args.gmm_covariance_type) + ','
-                args.name += 'gmm_tol: ' + str(args.gmm_tol) + ','
-                args.name += 'gmm_max_iter: ' + str(args.gmm_max_iter) + ','
-                args.name += 'gmm_random_state: ' + str(args.gmm_random_state) + ','
-                args.name += 'eps: ' + str(args.dbscan_eps) + ','
-                args.name += 'num_sample: ' + str(args.dbscan_num_sample) + ','
+                args.name += 'round: ' + str(args.global_epoch) + ','
                 args.name += 'malicious: ' + str(args.malicious) + ','
-            elif args.cluster_method == 'GMMDBSCAN':
-               args.name += 'gmm_num_clusters: ' + str(args.gmm_num_clusters) + ','
-               args.name += 'gmm_covariance_type: ' + str(args.gmm_covariance_type) + ','
-               args.name += 'gmm_tol: ' + str(args.gmm_tol) + ','
-               args.name += 'gmm_max_iter: ' + str(args.gmm_max_iter) + ','
-               args.name += 'gmm_random_state: ' + str(args.gmm_random_state) + ','
-               args.name += 'eps: ' + str(args.dbscan_eps) + ','
-               args.name += 'num_sample: ' + str(args.dbscan_num_sample) + ','
+            elif args.cluster_method == 'DBSCANISO':
+               args.name += 'round: ' + str(args.global_epoch) + ','
+               args.name += 'malicious: ' + str(args.malicious) + ','
+            elif args.cluster_method == 'GaussianMixtureISO':
+               args.name += 'round: ' + str(args.global_epoch) + ','
                args.name += 'malicious: ' + str(args.malicious) + ','
             args.name += str(args.logits_optim).split('.')[-1][:-2] + ' ' + str(args.logits_lr)
         case _:

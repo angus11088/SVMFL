@@ -35,7 +35,56 @@ class Client(object):
         self.dataset = Dataset(client_data_dict['x'], client_data_dict['y'])
         self.data_loader = torch.utils.data.DataLoader(self.dataset, batch_size = self.client_bs, shuffle = not self.MOON, pin_memory = True)
             
-    def local_train(self, client_model: torch.nn.Module, global_model: torch.nn.Module, previous_feature: torch.Tensor) -> list | torch.Tensor:
+    # def local_train(self, client_model: torch.nn.Module, global_model: torch.nn.Module, previous_feature: torch.Tensor) -> list | torch.Tensor:
+    #     """
+    #     Client local training with lookahead initialization for faster learning.
+
+    #     Arguments:
+    #         client_model (torch.nn.Module): pytorch model (client local model).
+    #         global_model (torch.nn.Module): pytorch model (global model).
+    #         previous_feature (torch.Tensor): features extracted by client model in last global epoch, useful for MOON.
+
+    #     Returns:
+    #         last_client_features (list | torch.Tensor): empty list, or features extracted by client model in current global epoch.
+    #     """
+    #     # print(f"[{self.client_name}] local_train() started.")
+    #     client_model.to(device)
+
+    #     # Step 1: Apply lookahead initialization to client model before training
+    #     self.apply_lookahead_initialization(client_model, global_model)
+
+    #     client_features = []
+    #     if self.MOON:
+    #         for current_client_epoch in range(self.client_epoch):
+    #             # client model train
+    #             if (previous_feature != None) and (client_features == []):
+    #                 client_features_tensor = previous_feature
+    #             elif (previous_feature == None) and (client_features == []):
+    #                 client_features_tensor = None
+    #             elif client_features != []:
+    #                 client_features_tensor = torch.zeros((len(client_features), client_features[0].shape[0], client_features[0].shape[1]))
+    #                 for idx, prev in enumerate(client_features):
+    #                     client_features_tensor[idx] = copy.deepcopy(prev.detach())
+    #                 client_features_tensor = client_features_tensor.cuda()
+
+    #             client_feat = model_train_MOON(client_model, global_model, self.data_loader, client_features_tensor)
+    #             client_features.append(client_feat)
+    #     elif self.FedProx:
+    #         model_train_FedProx(client_model, global_model, self.data_loader, self.client_epoch)
+    #     else:
+    #         model_train(client_model, self.data_loader, self.client_epoch)
+
+    #     client_model.to('cpu')
+    #     last_client_features = []
+    #     if self.MOON:
+    #         last_client_features = client_features[-1]
+
+    #     return client_model, last_client_features  # ✅ return 修改後的 model
+    # # 這段程式碼的目的是將來自全局模型（global_model）的權重與動量（momentum）更新應用到本地模型（client_model）中，並且進行 Lookahead 初始化。
+    # # Lookahead 是一種策略，旨在通過引入全局的動量來加速訓練。
+
+    def local_train(self, client_model: torch.nn.Module, global_model: torch.nn.Module, previous_feature: torch.Tensor,
+                malicious: bool = False, malicious_type: str = 'None') -> tuple[torch.nn.Module, list | torch.Tensor]:
         """
         Client local training with lookahead initialization for faster learning.
 
@@ -43,11 +92,14 @@ class Client(object):
             client_model (torch.nn.Module): pytorch model (client local model).
             global_model (torch.nn.Module): pytorch model (global model).
             previous_feature (torch.Tensor): features extracted by client model in last global epoch, useful for MOON.
+            malicious (bool): 是否為惡意客戶端，執行梯度擾動攻擊.
+            malicious_type (str): 惡意攻擊型態，可為 'None', 'Weak', 'Strong'.
 
         Returns:
-            last_client_features (list | torch.Tensor): empty list, or features extracted by client model in current global epoch.
+            tuple:
+                client_model (torch.nn.Module): 更新過權重的 client 模型.
+                last_client_features (list | torch.Tensor): empty list, 或當前 epoch 特徵.
         """
-        print(f"[{self.client_name}] local_train() started.")
         client_model.to(device)
 
         # Step 1: Apply lookahead initialization to client model before training
@@ -56,10 +108,9 @@ class Client(object):
         client_features = []
         if self.MOON:
             for current_client_epoch in range(self.client_epoch):
-                # client model train
-                if (previous_feature != None) and (client_features == []):
+                if (previous_feature is not None) and (client_features == []):
                     client_features_tensor = previous_feature
-                elif (previous_feature == None) and (client_features == []):
+                elif (previous_feature is None) and (client_features == []):
                     client_features_tensor = None
                 elif client_features != []:
                     client_features_tensor = torch.zeros((len(client_features), client_features[0].shape[0], client_features[0].shape[1]))
@@ -72,19 +123,19 @@ class Client(object):
         elif self.FedProx:
             model_train_FedProx(client_model, global_model, self.data_loader, self.client_epoch)
         else:
-            model_train(client_model, self.data_loader, self.client_epoch)
+            # 將惡意攻擊參數傳入 model_train
+            model_train(client_model, self.data_loader, self.client_epoch, malicious=malicious, malicious_type=malicious_type)
 
         client_model.to('cpu')
+
         last_client_features = []
         if self.MOON:
             last_client_features = client_features[-1]
 
-        return client_model, last_client_features  # ✅ return 修改後的 model
-    # 這段程式碼的目的是將來自全局模型（global_model）的權重與動量（momentum）更新應用到本地模型（client_model）中，並且進行 Lookahead 初始化。
-    # Lookahead 是一種策略，旨在通過引入全局的動量來加速訓練。
+        return client_model, last_client_features
 
     def apply_lookahead_initialization(self, client_model: torch.nn.Module, global_model: torch.nn.Module) -> None:
-        print(f"[{self.client_name}] apply_lookahead_initialization() start.")
+        # print(f"[{self.client_name}] apply_lookahead_initialization() start.")
         #  設置設備
         device = next(global_model.parameters()).device
         # 這段程式碼遍歷全局模型（global_model）中每個類別的權重（logits.weight）及偏置（logits.bias），對每個類別進行初始化。
@@ -121,7 +172,7 @@ class Client(object):
             client_model.logits.bias[class_id].data.copy_(bias)
 
         # 在整個初始化過程完成後，輸出一條消息，表明 Lookahead 初始化已經結束。
-        print(f"[{self.client_name}] apply_lookahead_initialization() done.")
+        # print(f"[{self.client_name}] apply_lookahead_initialization() done.")
 
 
 
