@@ -1,3 +1,4 @@
+import random
 import torch
 import torch.nn.functional as F
 import copy
@@ -235,46 +236,110 @@ class Resnet50_covid19(torch.nn.Module):
         x = self.logits(h)
         return x, h
 
-def model_train(model: torch.nn.Module, data_loader: torch.utils.data.DataLoader, num_client_epoch: int) -> None:
+# def model_train(model: torch.nn.Module, data_loader: torch.utils.data.DataLoader, num_client_epoch: int) -> None:
+#     """
+#     Train a model.
+
+#     Arguments:
+#         model (torch.nn.Module): pytorch model.
+#         data_loader (torch.utils.data.DataLoader): pytorch data loader.
+#         num_client_epoch (int): number of training epochs.
+#     """
+
+#     # for covid19 with resnet50
+#     if isinstance(model, Resnet50_covid19):
+#         resnet50_list[0].train()
+
+#     model.train()
+#     optim = model.optim(model.parameters(), lr = model.lr)
+
+#     # load previous optimizer state
+#     if model.reuse_optim and model.optim_state is not None:
+#         optim.load_state_dict(model.optim_state)
+    
+#     for current_client_epoch in range(num_client_epoch):
+#         for batch_id, (x, y) in enumerate(data_loader):
+#             x = x.to(device)
+#             y = y.to(device)
+            
+#             p, _ = model(x)
+#             loss = F.cross_entropy(p, y)
+#             loss.backward()
+        
+#             optim.step()
+#             optim.zero_grad()
+
+#             # stability
+#             for p in model.parameters():
+#                 torch.nan_to_num_(p.data, nan=1e-5, posinf=1e-5, neginf=1e-5)
+
+#     # save optimizer state
+#     if model.reuse_optim:
+#         model.optim_state = copy.deepcopy(optim.state_dict())
+
+def model_train(model: torch.nn.Module, 
+                data_loader: torch.utils.data.DataLoader, 
+                num_client_epoch: int,
+                malicious: bool = False,
+                malicious_type: str = 'None') -> None:
     """
-    Train a model.
+    Train a model with optional malicious gradient perturbation.
 
     Arguments:
         model (torch.nn.Module): pytorch model.
         data_loader (torch.utils.data.DataLoader): pytorch data loader.
         num_client_epoch (int): number of training epochs.
+        malicious (bool): 是否為惡意客戶端.
+        malicious_type (str): 惡意攻擊型態，可為 'None', 'Weak', 'Strong'
     """
 
-    # for covid19 with resnet50
     if isinstance(model, Resnet50_covid19):
         resnet50_list[0].train()
 
     model.train()
-    optim = model.optim(model.parameters(), lr = model.lr)
+    optim = model.optim(model.parameters(), lr=model.lr)
 
-    # load previous optimizer state
     if model.reuse_optim and model.optim_state is not None:
         optim.load_state_dict(model.optim_state)
-    
+
     for current_client_epoch in range(num_client_epoch):
         for batch_id, (x, y) in enumerate(data_loader):
             x = x.to(device)
             y = y.to(device)
-            
+
             p, _ = model(x)
             loss = F.cross_entropy(p, y)
             loss.backward()
-        
+
+            # 惡意梯度擾動
+            if malicious and malicious_type != 'None':
+                with torch.no_grad():
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            if malicious_type == 'GradientWeak':
+                                scale = random.uniform(1.0, 3.0)
+                                direction = torch.sign(torch.randn_like(param.grad))
+                                perturbation = scale * direction * torch.randn_like(param.grad)
+                                param.grad += perturbation
+                            elif malicious_type == 'GradientStrong':
+                                scale = random.uniform(5.0, 20.0)
+                                direction = torch.sign(torch.ones_like(param.grad))
+                                perturbation = scale * direction * torch.randn_like(param.grad) * 2.0
+                                param.grad += perturbation
+
+                            # 梯度穩定處理，避免 NaN、Inf
+                            torch.nan_to_num_(param.grad, nan=1e-5, posinf=1e2, neginf=-1e2)
+
             optim.step()
             optim.zero_grad()
 
-            # stability
+            # 權重數值穩定化
             for p in model.parameters():
-                torch.nan_to_num_(p.data, nan=1e-5, posinf=1e-5, neginf=1e-5)
+                torch.nan_to_num_(p.data, nan=1e-5, posinf=1e5, neginf=-1e5)
 
-    # save optimizer state
     if model.reuse_optim:
         model.optim_state = copy.deepcopy(optim.state_dict())
+
 
 def model_train_FedProx(model: torch.nn.Module, global_model: torch.nn.Module, data_loader: torch.utils.data.DataLoader, num_client_epoch: int) -> None:
     """

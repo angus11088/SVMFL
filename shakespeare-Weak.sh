@@ -1,10 +1,10 @@
 # bash code for reproducing our experiments
 # for project in femnist celeba shakespeare # covid19
 # for project in femnist celeba # covid19
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 for project in shakespeare # covid19
 do
-    for Method in GaussianMixtureDBSCAN
+    for Method in GaussianMixtureDBSCANISO
     #C 8 16 32
     #E 1 2 4
     #DBSCAN =>eps 0.1 (0.5) 0.9,num_sample 1/3*C 1/2*C  SVM random
@@ -30,7 +30,7 @@ do
                                         # for num_sample in 4 8 16
                                         for num_sample in 5
                                         do
-                                            for global_epoch in 100 300 500
+                                            for global_epoch in 101 301 501
                                             do
 
                                                 # if [ "$e" -eq 1 ] && [ "$c" -eq 8 ] && [ "$eps" = "0.1" ]; then

@@ -33,7 +33,7 @@ def main_non_FL(args: object) -> None:
     test_loader   = torch.utils.data.DataLoader(test_dataset , batch_size = args.global_bs, shuffle = False, pin_memory = True)
     
     # wandb init
-    wandb.init(project = args.project, name = args.name, config = args.__dict__, anonymous = "allow")
+    wandb.init(project = args.project, name = args.name, config = args.__dict__, anonymous = "allow", mode="offline")
 
     # performance before training
     model.to(device)

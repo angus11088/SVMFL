@@ -30,7 +30,7 @@ do
                                         # for num_sample in 4 8 16
                                         for num_sample in 5
                                         do
-                                            for global_epoch in 100 300 500
+                                            for global_epoch in 101 301 501
                                             do
 
                                                 # if [ "$e" -eq 1 ] && [ "$c" -eq 8 ] && [ "$eps" = "0.1" ]; then

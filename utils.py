@@ -65,7 +65,7 @@ def Args() -> argparse.Namespace:
     parser.add_argument('--min_sample', type = int, default = 64, help = 'minimal amount of samples per client')
     parser.add_argument('-g_bs', '--global_bs', type = int, default = 64, help = 'batch size for global data loader')
     parser.add_argument('-c_lr', '--client_lr', type = float, default = 1e-1, help = 'client learning rate')
-    parser.add_argument('-global_epoch', '--global_epoch', type = int, default = 201, help = 'number of global aggregation rounds')
+    parser.add_argument('-global_epoch', '--global_epoch', type = int, default = 501, help = 'number of global aggregation rounds')
     parser.add_argument('--reuse_optim', type = bool, default = False, action = argparse.BooleanOptionalAction, help = 'whether to reuse client optimizer, should be T for non-fl and F for FL')
     parser.add_argument('-c_op', '--client_optim', default = torch.optim.SGD, help = 'client optimizer')
                     
@@ -114,7 +114,7 @@ def Args() -> argparse.Namespace:
     parser.add_argument("--server_logits_mode", type=str, default="classwise", choices=["classwise", "global"])
 
     #惡意客戶模擬
-    parser.add_argument('--malicious', type = str, default = 'None', choices=['None', 'Weak', 'Strong'], help = 'malicious for client')
+    parser.add_argument('--malicious', type = str, default = 'None', choices=['None', 'Weak', 'Strong', 'GradientWeak', 'GradientStrong'], help = 'malicious for client')
     
     args = parser.parse_args()
     args.time = str(datetime.now())[5:-10]
@@ -318,43 +318,21 @@ def switch_FL(args: argparse.Namespace) -> None:
         case _:
             raise Exception("wrong switch_FL:", args.switch_FL)
     
-# def weighted_avg_params(params: list[dict[str, torch.Tensor]], weights: list[int] = None) -> dict[str, torch.Tensor]:
-#     """
-#     Compute weighted average of client models.
-
-#     Argument:
-#         params (list[dict[str, torch.Tensor]]): client model parameters. Each element in this list is the state_dict of a client model.
-#         weights (list[int]): weight per client. Each element in this list is the number of samples of a client.
-
-#     Returns:
-#         params_avg (dict[str], torch.Tensor): averaged global model parameters (state_dict), which can be loaded using global_model.load_state_dict.
-#     """
-
-#     if weights == None:
-#         weights = [1.0] * len(params)
-        
-#     params_avg = copy.deepcopy(params[0])
-#     for key in params_avg.keys():
-#         params_avg[key] *= weights[0]
-#         for i in range(1, len(params)):
-#             params_avg[key] += params[i][key] * weights[i]
-#         params_avg[key] = torch.div(params_avg[key], sum(weights))
-#     return params_avg
-
 def weighted_avg_params(params: list[dict[str, torch.Tensor]], weights: list[int] = None) -> dict[str, torch.Tensor]:
     """
     Compute weighted average of client models.
+
+    Argument:
+        params (list[dict[str, torch.Tensor]]): client model parameters. Each element in this list is the state_dict of a client model.
+        weights (list[int]): weight per client. Each element in this list is the number of samples of a client.
+
+    Returns:
+        params_avg (dict[str], torch.Tensor): averaged global model parameters (state_dict), which can be loaded using global_model.load_state_dict.
     """
-    if not params or len(params) == 0:
-        print("[WARNING] weighted_avg_params: 收到空的 client 參數，回傳 None")
-        return None
-    
-    if weights is None:
+
+    if weights == None:
         weights = [1.0] * len(params)
-
-    if len(weights) != len(params):
-        raise ValueError("[ERROR] weighted_avg_params: weights 和 params 長度不一致！")
-
+        
     params_avg = copy.deepcopy(params[0])
     for key in params_avg.keys():
         params_avg[key] *= weights[0]
@@ -362,6 +340,28 @@ def weighted_avg_params(params: list[dict[str, torch.Tensor]], weights: list[int
             params_avg[key] += params[i][key] * weights[i]
         params_avg[key] = torch.div(params_avg[key], sum(weights))
     return params_avg
+
+# def weighted_avg_params(params: list[dict[str, torch.Tensor]], weights: list[int] = None) -> dict[str, torch.Tensor]:
+#     """
+#     Compute weighted average of client models.
+#     """
+#     if not params or len(params) == 0:
+#         print("[WARNING] weighted_avg_params: 收到空的 client 參數，回傳 None")
+#         return None
+    
+#     if weights is None:
+#         weights = [1.0] * len(params)
+
+#     if len(weights) != len(params):
+#         raise ValueError("[ERROR] weighted_avg_params: weights 和 params 長度不一致！")
+
+#     params_avg = copy.deepcopy(params[0])
+#     for key in params_avg.keys():
+#         params_avg[key] *= weights[0]
+#         for i in range(1, len(params)):
+#             params_avg[key] += params[i][key] * weights[i]
+#         params_avg[key] = torch.div(params_avg[key], sum(weights))
+#     return params_avg
 
 def weighted_avg(values: any, weights: any, current_global_epoch: int) -> any:
     """
@@ -516,8 +516,8 @@ def weighted_avg_with_momentum_ACG(
     # 定一個目標範數 target_norm，用於控制更新的大小，避免過大的更新。
     # 構建 weight_key 和 bias_key，用於提取指定 class_id 的權重和偏置。
     # 根據是否存在 global_momentum，選擇使用提前計算的動量（lookahead_weight 和 lookahead_bias）還是當前的權重和偏置。
-    weight_key = f"logits.weight.{class_id}"
-    bias_key = f"logits.bias.{class_id}"
+    weight_key = f"logits.weight.{class_id}"#(客戶端ID)
+    bias_key = f"logits.bias.{class_id}"#(客戶端ID)
 
     if hasattr(global_model, "global_momentum"):
         lookahead_weight = global_model.global_momentum.get(weight_key, global_model.logits.weight[class_id])
@@ -559,7 +559,7 @@ def weighted_avg_with_momentum_ACG(
 
     # 梯度裁剪上限（Round數越多、參與越多，允許越大更新）
     delta_clip = compute_delta_clip_dynamic(num_clients, total_clients, current_round)
-    
+
     # 對 delta 進行裁剪：
     # 這裡計算了 delta（即梯度或更新量）的 L2 norm，並對 delta 進行裁剪，防止過大的更新。
     # 若 delta 的 norm 超過設定的 delta_clip，則將其縮放，使其 norm 恢復到 delta_clip 的範圍內，從而防止梯度爆炸。
@@ -617,7 +617,7 @@ def weighted_avg_with_momentum_ACG(
     # 自適應調整 blending factor alpha
     # alpha 是 logits 更新中，momentum 權重的參數：
     # avg_norm_ratio 控制更新幅度（norm 太大就降低比例）。
-    avg_norm_ratio = min(1.0, adjusted_max_avg_norm / avg_norm)
+    history_avg_norm_ratio = min(1.0, adjusted_max_avg_norm / avg_norm)
     # 線性成長的 alpha_base，根據 round 數提升
     # 到了訓練中期以後（約一半輪次），模型參數大致穩定，此時就可以更信任過去的 momentum 更新，早期保守更新，後期穩定收斂
     # 客戶參與度縮放因子
@@ -628,7 +628,7 @@ def weighted_avg_with_momentum_ACG(
     alpha_base = min(current_round / (global_epoch / 2), 1.0)
     # alpha 越大代表「越相信 momentum」。
     # 最終 alpha
-    alpha = alpha_base * client_scale_ratio * avg_norm_ratio
+    alpha = alpha_base * client_scale_ratio * history_avg_norm_ratio
 
     wandb.define_metric("current_round")
 
@@ -650,6 +650,13 @@ def weighted_avg_with_momentum_ACG(
     # 最終 logits 層參數更新：混合使用兩個資訊：1.avg：整體平均參數（較穩定）。 2.old_wb + new_momentum：加權的慣性更新方向（包含當前變化趨勢）。
     updated = (1 - alpha) * avg + alpha * (old_wb + new_momentum)
 
+    dist_old_to_avg = (avg - old_wb).norm()
+    dist_old_to_updated = (updated - old_wb).norm()
+    ratio_thresh = 2.5 if current_round >= 100 else 2.0
+    if dist_old_to_updated > dist_old_to_avg * ratio_thresh:
+        print(f"[WARNING] round={current_round} class={class_id} | updated 偏離過大，使用 avg")
+        updated = avg.detach().clone()
+
     # 這段將 momentum 的權重部分和 bias 部分分別儲存起來，方便後續模型更新使用。
     if not hasattr(global_model, "global_momentum"):
         global_model.global_momentum = {}
@@ -659,13 +666,22 @@ def weighted_avg_with_momentum_ACG(
     # step 13. 回傳最終 updated 參數
     return updated
 
+# def compute_delta_clip_dynamic(num_clients, total_clients, current_round, total_rounds, local_epoch):
+
+#     client_ratio = num_clients / total_clients    #客戶參與率
+#     scaled_round = current_round / total_clients  # 將 current_round 與 total_clients 比例化，避免過大數值
+#     # 讓函數在 x → 0 附近不會趨近於負無限，而是有一個穩定的起點
+#     round_factor = math.log(1 + math.exp(scaled_round))
+#     delta_clip = (client_ratio * round_factor) / local_epoch
+
+#     return delta_clip
+
 def compute_delta_clip_dynamic(num_clients, total_clients, current_round):
+    client_ratio = num_clients / total_clients
+    scaled_round = current_round / total_clients
 
-    client_ratio = num_clients / total_clients    #客戶參與率
-    scaled_round = current_round / total_clients  # 將 current_round 與 total_clients 比例化，避免過大數值
-    # 讓函數在 x → 0 附近不會趨近於負無限，而是有一個穩定的起點
-    round_factor = math.log(1 + math.exp(scaled_round))
-    delta_clip = client_ratio * round_factor
+    # 使用雙層 log 壓制爆炸增長
+    round_factor = math.log(1 + math.log(1 + math.exp(scaled_round)))
 
+    delta_clip = (client_ratio * round_factor)
     return delta_clip
-

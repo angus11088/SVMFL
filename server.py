@@ -265,6 +265,11 @@ def federated_learning(args: object, train_clients: list[object], test_clients: 
         continue_training = True
         tmp_global_model = copy.deepcopy(global_model)
 
+        # ------------ 惡意客戶端標記 ------------
+        num_clients = len(update_clients)
+        num_malicious = 3  # 固定三個惡意客戶端
+        malicious_indices = random.sample(range(num_clients), num_malicious)
+
         # 步驟 5：訓練客戶端
         # training
         if args.switch_FL == "FedEFC":
@@ -272,11 +277,34 @@ def federated_learning(args: object, train_clients: list[object], test_clients: 
             for client, client_model in zip(update_clients, client_models):
                 previous_features = client.local_train(client_model, global_model, previous_features)
 
-        elif args.switch_FL == "FedGMMDBACG":
-            # ✅ FedGMMDBACG 對應的新版本，會回傳 updated_model
+        # elif args.switch_FL == "FedGMMDBACG":
+        #     # ✅ FedGMMDBACG 對應的新版本，會回傳 updated_model
+        #     for i, (client, client_model) in enumerate(zip(update_clients, client_models)):
+        #         updated_model, previous_features = client.local_train(client_model, global_model, previous_features)
+        #         client_models[i] = updated_model  # ✅ overwrite 原本的 client_model
+        elif args.switch_FL == "FedGMMDBACG" and args.malicious != 'None' and args.malicious != 'Weak' and args.malicious != 'Strong':
+            num_clients = len(update_clients)
+            num_malicious = 3  # 固定三個惡意客戶端
+            malicious_indices = random.sample(range(num_clients), num_malicious)
+            # 🔍 印出本輪的惡意客戶端索引或名稱
+            print(f"🔴 本輪梯度惡意客戶端索引: {malicious_indices}")
+            print("🔴 對應惡意客戶端名稱: ", [update_clients[i].client_name if hasattr(update_clients[i], 'client_name') else f"Client-{i}" for i in malicious_indices])
             for i, (client, client_model) in enumerate(zip(update_clients, client_models)):
-                updated_model, previous_features = client.local_train(client_model, global_model, previous_features)
-                client_models[i] = updated_model  # ✅ overwrite 原本的 client_model
+                if i in malicious_indices and args.malicious != 'None' and args.malicious != 'Weak' and args.malicious != 'Strong':
+                    malicious_flag = True
+                    malicious_type = args.malicious  # 'GradientWeak' 或 'GradientStrong'
+                else:
+                    malicious_flag = False
+                    malicious_type = 'None'
+
+                updated_model, previous_features = client.local_train(
+                    client_model,
+                    global_model,
+                    previous_features,
+                    malicious=malicious_flag,
+                    malicious_type=malicious_type
+                )
+                client_models[i] = updated_model  # 覆蓋更新後的模型
         else:
             # ✅ 其他的 for 迴圈，這裡不需要改動
             for client, client_model in zip(update_clients, client_models):
@@ -291,7 +319,14 @@ def federated_learning(args: object, train_clients: list[object], test_clients: 
         if num_clients <= 10:
             num_malicious = 1 #若client數量小於10，則隨機選擇1個client，client為8、惡意客戶端為2或以上的時候，我的訓練會崩潰
         else:
-            num_malicious = min(3, max(2, num_clients // 4))
+            # 若 client 數量 >= 16，則指定 50% 為惡意
+            if num_clients >= 16:
+                num_malicious = int(num_clients * 0.2)  # 20% 惡意
+                # num_malicious = int(num_clients * 0.5)  # 50% 惡意
+            else:
+                # 否則使用最多 25% 的邏輯
+                num_malicious = min(10, max(2, num_clients // 4))
+            # num_malicious = min(3, max(2, num_clients // 4))
 
         malicious_indices = random.sample(range(num_clients), num_malicious)
         if args.malicious == 'None':
@@ -337,7 +372,7 @@ def federated_learning(args: object, train_clients: list[object], test_clients: 
                         perturbation = scale * direction * torch.randn_like(p.data) * 2.0  # 擴大隨機性
                         p.data += perturbation
 
-                        # 🛡 數值穩定化（仍保留以避免 NaN 爆炸）
+                        # 數值穩定化（仍保留以避免 NaN 爆炸）
                         torch.nan_to_num_(p.data, nan=1e-5, posinf=1e3, neginf=-1e3)
 
                     # ❌ 移除 logits clamp（放寬惡意破壞能力）
@@ -360,41 +395,47 @@ def federated_learning(args: object, train_clients: list[object], test_clients: 
             # stability
             for p in global_model.parameters():
                 torch.nan_to_num_(p.data, nan=1e-5, posinf=1e-5, neginf=1e-5)
-
         # 步驟 7：過濾異常客戶端的更新
         # 使用 filter_outlier_clients 函數檢測並過濾那些更新與全局模型過度偏離的客戶端。
         # 這個過程會根據 zscore 或 IQR 方法來確定哪些更新是異常的，這有助於提高聯邦學習的穩定性。
-        while continue_training and (args.switch_FL == 'FedEFC' or args.switch_FL == 'FedGMMDBACG'):
-            # 全局模型聚合
-            # ✅ 在聚合前移除異常更新(梯度爆炸的class去除)
-            client_models, client_weights, all_filtered = robust_filter_outlier_clients(
-                global_model, client_models, client_weights
-            )
+        elif args.switch_FL == 'FedEFC' or args.switch_FL == 'FedGMMDBACG':
+            while continue_training:
+                # 全局模型聚合
+                # ✅ 在聚合前移除異常更新(梯度爆炸的class去除)
+                client_models, client_weights, all_filtered = robust_filter_outlier_clients(
+                    global_model, client_models, client_weights
+                )
 
-            # 步驟 8：模型聚合與更新
-            # 根據不同的聯邦學習方法（FedEFC、FedGMMDBACG、TurboSVM 等），進行全局模型的聚合。
-            eval(args.fed_agg)(
-                global_model, client_models, client_weights,  # 基本聯邦學習參數
-                global_optim,  # 用於 FedOpt（FedAdam 和 FedAMS）
-                logits_optim,  # 用於 FedAwS 和 TurboSVM
-                current_global_epoch,  args.class_C, args.base_agg, args.agg_svc, args.spreadout,  # 用於 TurboSVM
-                args.cluster_method, args.num_clusters, args.dbscan_eps, args.dbscan_num_sample, args.client_epoch,  args.global_epoch,# 用於 FedGMMDBACG
-            )
-            # 步驟 9：穩定性處理
-            # 穩定性處理，使用 torch.nan_to_num_ 來將模型參數中的 NaN 或無窮大值替換為合理的數值。
-            for p in global_model.parameters():
-                torch.nan_to_num_(p.data, nan=1e-5, posinf=1e-5, neginf=1e-5)
+                # 步驟 8：模型聚合與更新
+                # 根據不同的聯邦學習方法（FedEFC、FedGMMDBACG、TurboSVM 等），進行全局模型的聚合。
+                eval(args.fed_agg)(
+                    global_model, client_models, client_weights,  # 基本聯邦學習參數
+                    global_optim,  # 用於 FedOpt（FedAdam 和 FedAMS）
+                    logits_optim,  # 用於 FedAwS 和 TurboSVM
+                    current_global_epoch,  args.class_C, args.base_agg, args.agg_svc, args.spreadout,  # 用於 TurboSVM
+                    args.cluster_method, args.num_clusters, args.dbscan_eps, args.dbscan_num_sample, args.client_epoch,  args.global_epoch,# 用於 FedGMMDBACG
+                )
+                # 步驟 9：穩定性處理
+                # 穩定性處理，使用 torch.nan_to_num_ 來將模型參數中的 NaN 或無窮大值替換為合理的數值。
+                for p in global_model.parameters():
+                    torch.nan_to_num_(p.data, nan=1e-5, posinf=1e-5, neginf=1e-5)
 
-            global_train_loader = torch.utils.data.DataLoader(
-                global_train_dataset, batch_size=args.global_bs, shuffle=False, pin_memory=True
-            )
-            labels, preds = model_eval(global_model, global_train_loader, wandb_log, 'train/', True)
-            acc = accuracy_score(preds.argmax(axis=1), labels)
-            history_acc.append(acc)
-            print_filter_stats()
-            # 結束訓練
-            break
-
+                global_train_loader = torch.utils.data.DataLoader(
+                    global_train_dataset, batch_size=args.global_bs, shuffle=False, pin_memory=True
+                )
+                labels, preds = model_eval(global_model, global_train_loader, wandb_log, 'train/', True)
+                acc = accuracy_score(preds.argmax(axis=1), labels)
+                history_acc.append(acc)
+                print_filter_stats()
+                # 結束訓練
+                break
+        else:
+            # 預設執行 FedAvg 或其他 baseline 方法
+            eval(args.fed_agg)(global_model, client_models, client_weights,
+                            global_optim,
+                            logits_optim,
+                            current_global_epoch, args.global_epoch,
+                            args.class_C, args.base_agg, args.agg_svc, args.spreadout)
         # 步驟 10：性能評估
         # performance metrics
         global_train_dataset = torch.utils.data.ConcatDataset([c.dataset for c in update_clients])
@@ -764,13 +805,15 @@ def FedEFC(global_model: torch.nn.Module,
             # 無聚類方法，將全部數據視為一個簇
             labels = np.zeros(len(x), dtype=int)
 
-        case 'GaussianMixtureDBSCAN':
+        case 'GaussianMixtureDBSCANISO':
             print("Running GMM-only anomaly detection...")
 
+            # 高斯混合模型（GMM）初始化與篩選
+            # step 1. 標準化數據： 這部分將每個客戶端模型的參數（parameters()）展平並拼接，然後對這些參數進行標準化處理，確保後續的異常偵測過程不會受異常範圍的影響。
             scaler = StandardScaler()
             x_raw = np.array([np.concatenate([p.data.cpu().numpy().flatten() for p in m.parameters()]) for m in client_models])
             x_scaled = scaler.fit_transform(x_raw)
-
+            # step 2. PCA 降維：這部分將數據降維到 10 維，這樣可以減少計算量並提高 GMM 的性能。
             pca_dim = min(10, x_scaled.shape[0], x_scaled.shape[1])
             if x_scaled.shape[1] > pca_dim:
                 pca = PCA(n_components=pca_dim)
@@ -779,9 +822,9 @@ def FedEFC(global_model: torch.nn.Module,
             valid_clients = np.full(len(x_scaled), True)  # 預設全部 valid
             labels = np.full(len(x_scaled), -1)
 
-            # try:
+            # step 3. GMM 聚類：使用高斯混合模型（GMM）對客戶端模型進行聚類，通過計算每個模型屬於某一群集的機率，選擇出屬於主群集的模型。這是用來檢測是否存在異常數據點。
             gmm = GaussianMixture(
-                n_components=min(gmm_num_clusters, len(x_scaled) // 2),
+                n_components=max(2, min(gmm_num_clusters, len(x_scaled)//2)),
                 covariance_type=gmm_covariance_type,
                 tol=gmm_tol,
                 max_iter=gmm_max_iter,
@@ -810,12 +853,11 @@ def FedEFC(global_model: torch.nn.Module,
             def mahalanobis_dist(x, mean, cov_inv):
                 return distance.mahalanobis(x, mean, cov_inv)
 
+            # step 4. Mahalanobis 距離計算：這部分計算每個客戶端模型到其所屬群集均值的 Mahalanobis 距離，並根據距離的分佈篩選出距離較近的模型。這是用來進一步檢測異常數據點。
             distances = np.array([
                 mahalanobis_dist(x_scaled[i], gmm.means_[gmm_labels[i]], np.linalg.inv(gmm.covariances_[gmm_labels[i]]))
                 for i in range(len(x_scaled))
             ])
-            # z_scores = (distances - np.mean(distances)) / np.std(distances)
-            # z_pass = np.abs(z_scores) < 1  # Z-score 小於 1（更合理界定）
             z_pass = distances < np.percentile(distances, 90)  # 保留前 90% 接近的客戶端
 
             # 來自 GMM 分群的分析結果。
@@ -825,31 +867,28 @@ def FedEFC(global_model: torch.nn.Module,
             # 3️⃣ Mahalanobis 距離的 Z-score < 1 (z_pass)
             # 🎯 GMM 最終 valid clients
             gmm_valid = in_majority & prob_pass & z_pass
-             # 額外加入 weight norm 檢查（強化不一致異常偵測）
-            weight_norms = np.linalg.norm(x_scaled, axis=1)
-            norm_mean, norm_std = np.mean(weight_norms), np.std(weight_norms)
-            norm_z = (weight_norms - norm_mean) / norm_std
-            norm_pass = (np.abs(norm_z) < 2.5)
-
+            
+            # step 5.  Isolation Forest 進行異常檢測，額外異常檢測： 使用 Isolation Forest 進行進一步的異常偵測，這些方法能夠檢測到離群的數據點，並將其標記為異常。
             # 訓練 Isolation Forest 模型
             iso_forest = IsolationForest(n_estimators=100, contamination=0.1, random_state=random_state)
             iso_forest.fit(x_scaled)
             iso_labels = iso_forest.predict(x_scaled)
             iso_pass = (iso_labels == 1)  # 標記為正常的 client
 
+            # step 6. DBSCAN 檢測：使用 DBSCAN 進行進一步的異常檢測，這部分將數據分為不同的簇，並將噪聲點標記為 -1。這是用來檢測是否存在異常數據點。
             # 進一步的 DBSCAN 檢測
             dbscan = DBSCAN(eps=dbscan_eps, min_samples=dbscan_num_sample)
             dbscan_labels = dbscan.fit_predict(x_scaled)
 
             # DBSCAN 噪聲標籤 -1 代表噪聲
             dbscan_valid = (dbscan_labels != -1)  # 只保留非噪聲點
-            dbscan_valid_indices = np.where(dbscan_valid)[0].tolist()
 
+            # step 7. 最後的有效 client 條件：綜合多重條件篩選有效客戶端：這些條件包括 GMM 聚類、DBSCAN、Mahalanobis 距離、Isolation Forest、LOF 和其他異常檢測條件。
             # 最後的有效 client 條件：所有條件滿足才是有效
-            if(dbscan_valid.sum() <= class_C/2):
-                valid_clients = gmm_valid & norm_pass & iso_pass
+            if dbscan_valid.sum() >= len(client_models) / 2:
+                valid_clients = gmm_valid & dbscan_valid & iso_pass
             else:
-                valid_clients = gmm_valid & dbscan_valid & norm_pass & iso_pass
+                valid_clients = gmm_valid & iso_pass
 
             # 後續處理
             filtered_client_models = [m for i, m in enumerate(client_models) if valid_clients[i]]
@@ -858,29 +897,49 @@ def FedEFC(global_model: torch.nn.Module,
             if len(filtered_client_models) > 0:
                 print("🔁 使用 valid clients 更新 global model")
                 eval(base_agg)(global_model, filtered_client_models, filtered_client_weights, global_optim)
+            # 若是沒有有效的可使用客戶端則進行 以下操作
             else:
                 print("⚠️ 沒有 valid clients，改採用 GMM 最大群集進行 fallback 聚合")
-
-                # fallback：選擇 GMM 最大群集作為 valid_clients
+                # step 1. fallback：選擇 GMM 最大群集作為 valid_clients
                 counts = np.bincount(gmm_labels)
                 majority_cluster = np.argmax(counts)
                 fallback_valid_clients = (gmm_labels == majority_cluster)
 
-                # 使用 fallback valid clients
+                # step 2. 使用 fallback valid clients
                 filtered_client_models = [m for i, m in enumerate(client_models) if fallback_valid_clients[i]]
                 filtered_client_weights = [w for i, w in enumerate(client_weights) if fallback_valid_clients[i]]
                 
+                # step 3. 最終過濾與更新： 在過濾出有效的客戶端後，使用修剪平均方法對客戶端模型進行聚合，並更新全局模型。
                 if len(filtered_client_models) > 0:
                     print("🔁 使用 fallback clients 更新 global model")
                     eval(base_agg)(global_model, filtered_client_models, filtered_client_weights, global_optim)
+                    # 重建 x, y, w：為 agg_svc 做好準備
+                    x, y, w = [], [], []
+                    for m, cw in zip(filtered_client_models, filtered_client_weights):
+                        wb = torch.cat((m.logits.weight[classes], m.logits.bias[classes].view(-1, 1)), axis=1).detach()
+                        x.append(wb)
+                        y += classes
+                        w += [cw] * len(classes)
+                    x = torch.cat(x)
+                    labels = np.zeros(len(x), dtype=int)  # fallback 時可統一視為同一簇
+
                 else:
                     print("⛔ fallback 聚合也失敗，跳過這一輪")
 
+            remove_iso = np.where(~iso_pass)[0].tolist()
+            remove_GMM = np.where(~gmm_valid)[0].tolist()
+            remove_dbscan = np.where(~dbscan_valid)[0].tolist()
+            # --- 統計與輸出 ---
+            # 消溶實驗、證明GM、ISO、DBSCAN等方法的有效性
+            removed_indices = np.where(~valid_clients)[0].tolist()
+            print(f"❌ 本輪被篩除的 clients indices: {removed_indices}")
             print(f"✅ Valid clients: {np.sum(valid_clients)} / {len(client_models)}")
             print(f"✅ GMM valid: {np.sum(gmm_valid)} / {len(gmm_valid)}")
-            print(f"✅ Norm pass: {np.sum(norm_pass)} / {len(norm_pass)}")
+            print(f"❌ 本輪被篩除的 remove_GMM: {remove_GMM}")
             print(f"✅ ISO pass: {np.sum(iso_pass)} / {len(iso_pass)}")
+            print(f"❌ 本輪被篩除的 ISO: {remove_iso}")
             print(f"✅ DBSCAN pass: {np.sum(dbscan_valid)} / {len(dbscan_valid)}")
+            print(f"❌ 本輪被篩除的 DBSCAN: {remove_dbscan}")
 
         case 'GMMDBSCAN':
             print("Running GMM + DBSCAN + Others anomaly detection...")
@@ -1502,7 +1561,7 @@ def FedGMMDBACG(global_model: torch.nn.Module,
 
                 else:
                     print("⛔ fallback 聚合也失敗，跳過這一輪")
-            
+
             remove_iso = np.where(~iso_pass)[0].tolist()
             remove_GMM = np.where(~gmm_valid)[0].tolist()
             remove_dbscan = np.where(~dbscan_valid)[0].tolist()
